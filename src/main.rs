@@ -87,7 +87,7 @@ impl Body {
             }
 
             // problem 3
-            Payload::Broadcast { message } => Some(Body {
+            Payload::Broadcast { .. } => Some(Body {
                 in_reply_to: self.msg_id,
                 extra: Payload::BroadcastOk {},
                 msg_id: None,
