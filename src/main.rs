@@ -59,6 +59,62 @@ struct Body {
     extra: Payload,
 }
 
+impl Body {
+    fn reply(&self, node: &Node) -> Option<Body> {
+        match &self.extra {
+            Payload::Init { .. } => Some(Body {
+                in_reply_to: self.msg_id,
+                extra: Payload::InitOk {},
+                msg_id: None,
+            }),
+
+            // problem 1
+            Payload::Echo { echo } => Some(Body {
+                in_reply_to: self.msg_id,
+                extra: Payload::EchoOk { echo: echo.clone() },
+                msg_id: None,
+            }),
+
+            // problem 2, could also use ulid
+            Payload::Generate => {
+                let id = format!("{}-{}", node.id, node.msg_ids);
+                Some(Body {
+                    in_reply_to: self.msg_id,
+                    extra: Payload::GenerateOk { id },
+                    msg_id: None,
+                })
+            }
+
+            // problem 3
+            Payload::Broadcast { message } => Some(Body {
+                in_reply_to: self.msg_id,
+                extra: Payload::BroadcastOk {},
+                msg_id: None,
+            }),
+
+            Payload::Read => Some(Body {
+                in_reply_to: self.msg_id,
+                msg_id: None,
+                extra: Payload::ReadOk {
+                    messages: node.messages.iter().map(|i| *i).collect::<Vec<usize>>(),
+                },
+            }),
+
+            Payload::Topology { .. } => Some(Body {
+                in_reply_to: self.msg_id,
+                msg_id: None,
+                extra: Payload::TopologyOk {},
+            }),
+            Payload::BroadcastOk => None,
+            Payload::EchoOk { .. } => None,
+            Payload::InitOk => None,
+            Payload::GenerateOk { .. } => None,
+            Payload::ReadOk { .. } => None,
+            Payload::TopologyOk => None,
+        }
+    }
+}
+
 struct Node {
     output: io::Stdout,
     id: String,
@@ -66,6 +122,7 @@ struct Node {
     msg_ids: u64,
 
     messages: HashSet<usize>,
+    pending: HashMap<u64, (String, Body)>,
 }
 
 impl Node {
@@ -76,73 +133,15 @@ impl Node {
             nodes,
             msg_ids: 0,
             messages: HashSet::new(),
+            pending: HashMap::new(),
         }
     }
 
-    fn reply(&mut self, body: &Body) -> Option<Body> {
-        match &body.extra {
-            Payload::Init { .. } => Some(Body {
-                in_reply_to: body.msg_id,
-                extra: Payload::InitOk {},
-                msg_id: None,
-                // msg_id: Some(self.msg_ids),
-            }),
-
-            // problem 1
-            Payload::Echo { echo } => Some(Body {
-                // msg_id: Some(self.msg_ids),
-                in_reply_to: body.msg_id,
-                extra: Payload::EchoOk { echo: echo.clone() },
-                msg_id: None,
-            }),
-
-            // problem 2, could also use ulid
-            Payload::Generate => {
-                let id = format!("{}-{}", self.id, self.msg_ids);
-                Some(Body {
-                    // msg_id: Some(self.msg_ids),
-                    in_reply_to: body.msg_id,
-                    extra: Payload::GenerateOk { id },
-                    msg_id: None,
-                })
-            }
-
-            // problem 3
-            Payload::Broadcast { message } => {
-                if self.messages.contains(message) {
-                    return None;
-                }
-                self.messages.insert(*message);
-                Some(Body {
-                    // msg_id: Some(self.msg_ids),
-                    in_reply_to: body.msg_id,
-                    extra: Payload::BroadcastOk {},
-                    msg_id: None,
-                })
-            }
-
-            Payload::Read => Some(Body {
-                in_reply_to: body.msg_id,
-                msg_id: None,
-                extra: Payload::ReadOk {
-                    messages: self.messages.iter().map(|i| *i).collect::<Vec<usize>>(),
-                },
-            }),
-
-            Payload::Topology { .. } => Some(Body {
-                in_reply_to: body.msg_id,
-                msg_id: None,
-                extra: Payload::TopologyOk {},
-            }),
-            Payload::BroadcastOk => None,
-            _ => todo!(),
-            // Payload::EchoOk { echo } => {}
-            // Payload::InitOk => {}
-            // Payload::GenerateOk { id } => {}
-            // Payload::ReadOk { messages } => {}
-            // Payload::TopologyOk => {}
-        }
-    }
+    // async fn rpc(&mut self, dest: &str, mut body: Body) -> io::Result<()> {
+    //     self.pending
+    //         .insert(body.msg_id.unwrap(), (dest.to_string(), body.clone()));
+    //     self.send(dest, body).await
+    // }
 
     async fn send(&mut self, dest: &str, mut body: Body) -> io::Result<()> {
         self.msg_ids += 1;
@@ -163,27 +162,27 @@ impl Node {
 
     async fn handle(&mut self, line: &str) -> io::Result<()> {
         let msg = serde_json::from_str::<Msg>(line)?;
-        let next_msg = self.reply(&msg.body);
-        if next_msg.is_none() {
-            return Ok(());
-        }
-        let next_msg = next_msg.unwrap();
-        if let Payload::Broadcast { .. } = msg.body.extra {
-            // this really works for 2 reason:
-            // we broadcast to all nodes, not just neighbors and we avoid loops
-            // because we don't retransmit to ourselves or source and we don't
-            // further re-broadcast if we have the message already
-            // (because it means we've already broadcast it, which is cheating a bit)
-            let iter_nodes = self.nodes.clone();
-            for node in iter_nodes {
-                if node == self.id || node == msg.src {
-                    continue;
+        match msg.body.extra {
+            Payload::Broadcast { message } => {
+                if !self.messages.contains(&message) {
+                    self.messages.insert(message);
+                    let iter_nodes = self.nodes.clone();
+                    for node in iter_nodes {
+                        if node == self.id || node == msg.src {
+                            continue;
+                        }
+                        self.send(&node, msg.body.clone()).await?;
+                    }
                 }
-
-                self.send(&node, msg.body.clone()).await?;
             }
+
+            Payload::BroadcastOk => {}
+            _ => {}
         }
-        self.send(&msg.src, next_msg).await?;
+
+        if let Some(next_msg) = msg.body.reply(self) {
+            self.send(&msg.src, next_msg).await?;
+        }
         Ok(())
     }
 }
@@ -206,7 +205,7 @@ async fn main() -> io::Result<()> {
     } else {
         panic!("abort first message should be init");
     };
-    let next_msg = n.reply(&msg.body);
+    let next_msg = msg.body.reply(&n);
     n.send(&msg.src, next_msg.unwrap()).await?;
 
     // main loop
