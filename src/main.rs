@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use tokio::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::time::{self, Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -137,11 +138,11 @@ impl Node {
         }
     }
 
-    // async fn rpc(&mut self, dest: &str, mut body: Body) -> io::Result<()> {
-    //     self.pending
-    //         .insert(body.msg_id.unwrap(), (dest.to_string(), body.clone()));
-    //     self.send(dest, body).await
-    // }
+    async fn rpc(&mut self, dest: &str, body: Body) -> io::Result<()> {
+        self.pending
+            .insert(body.msg_id.unwrap(), (dest.to_string(), body.clone()));
+        self.send(dest, body).await
+    }
 
     async fn send(&mut self, dest: &str, mut body: Body) -> io::Result<()> {
         self.msg_ids += 1;
@@ -160,23 +161,35 @@ impl Node {
         Ok(())
     }
 
+    async fn gossip(&mut self) -> io::Result<()> {
+        // this is really problem 3b (broadcast with partitions)
+        // not sure I like this too much with mem::replace but it works fine
+        let drained = std::mem::replace(&mut self.pending, HashMap::new());
+        for (_, (dest, msg)) in drained {
+            self.rpc(&dest, msg).await?;
+        }
+        Ok(())
+    }
+
     async fn handle(&mut self, line: &str) -> io::Result<()> {
         let msg = serde_json::from_str::<Msg>(line)?;
-        match msg.body.extra {
+        match &msg.body.extra {
             Payload::Broadcast { message } => {
-                if !self.messages.contains(&message) {
-                    self.messages.insert(message);
-                    let iter_nodes = self.nodes.clone();
-                    for node in iter_nodes {
-                        if node == self.id || node == msg.src {
+                if !self.messages.contains(message) {
+                    self.messages.insert(*message);
+                    for idx in 0..self.nodes.len() {
+                        let node = &self.nodes[idx];
+                        if *node == self.id || *node == msg.src {
                             continue;
                         }
-                        self.send(&node, msg.body.clone()).await?;
+                        self.rpc(&node.clone(), msg.body.clone()).await?;
                     }
                 }
             }
 
-            Payload::BroadcastOk => {}
+            Payload::BroadcastOk => {
+                self.pending.remove(&msg.body.in_reply_to.unwrap());
+            }
             _ => {}
         }
 
@@ -208,10 +221,23 @@ async fn main() -> io::Result<()> {
     let next_msg = msg.body.reply(&n);
     n.send(&msg.src, next_msg.unwrap()).await?;
 
-    // main loop
-    while let Some(line) = input_lines.next_line().await.unwrap() {
-        eprintln!("{}", line);
-        n.handle(&line).await?;
+    let mut interval = time::interval(Duration::from_millis(300));
+    loop {
+        tokio::select! {
+            maybe_line = input_lines.next_line() => {
+                if let Ok(Some(line)) = maybe_line {
+
+                eprintln!("{}", line);
+                n.handle(&line).await.unwrap();
+                } else {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                n.gossip().await?;
+            }
+        }
     }
+
     Ok(())
 }
