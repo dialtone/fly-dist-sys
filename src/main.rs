@@ -175,6 +175,10 @@ impl Node {
         let msg = serde_json::from_str::<Msg>(line)?;
         match &msg.body.extra {
             Payload::Broadcast { message } => {
+                // since we're guaranteed that messages are unique
+                // and we broadcast to every node...
+                // if I already have something in my memory it means I already broadcast it properly
+                // so it works but it's horrible although simple
                 if !self.messages.contains(message) {
                     self.messages.insert(*message);
                     for idx in 0..self.nodes.len() {
@@ -226,9 +230,8 @@ async fn main() -> io::Result<()> {
         tokio::select! {
             maybe_line = input_lines.next_line() => {
                 if let Ok(Some(line)) = maybe_line {
-
-                eprintln!("{}", line);
-                n.handle(&line).await.unwrap();
+                    eprintln!("{}", line);
+                    n.handle(&line).await.unwrap();
                 } else {
                     break;
                 }
